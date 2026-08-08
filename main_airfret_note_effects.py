@@ -1,6 +1,3 @@
-#changes will be made to this file to test prototype new wiring system
-# working on volume control and oled display( day 2)
-
 from machine import Pin, ADC, I2S, I2C
 import math
 import struct
@@ -10,12 +7,13 @@ import ssd1306
 
 
 # ============================================================
-# AIRFRET PERFORMANCE ENGINE
+# AIRFRET CLEAN CONTINUOUS PERFORMANCE ENGINE
 #
 # INSTANT CHORD SWITCHING
 # FLASH-BASED GUITAR SOUND BANK
 #
-# NO VOLUME CONTROL YET
+# FILTERED SLIDER VOLUME CONTROL
+# OLED VOLUME DISPLAY
 # ============================================================
 
 
@@ -91,6 +89,49 @@ joystick_switch = Pin(
 joystick_x = ADC(27)
 
 joystick_y = ADC(28)
+
+
+# ============================================================
+# VOLUME SLIDER
+# ============================================================
+# Slider fixed ends -> 3V3 and GND
+# Slider wiper -> GP26 / ADC0
+#
+# Software filtering:
+# - averages ADC readings
+# - low-pass smoothing
+# - endpoint dead zones
+# - 2% hysteresis
+# ============================================================
+
+volume_adc = ADC(26)
+
+VOLUME_MIN = 2500
+VOLUME_MAX = 63000
+
+volume_filtered = volume_adc.read_u16()
+
+if volume_filtered <= VOLUME_MIN:
+    volume_percent = 0
+elif volume_filtered >= VOLUME_MAX:
+    volume_percent = 100
+else:
+    volume_percent = (
+        (volume_filtered - VOLUME_MIN)
+        * 100
+        // (VOLUME_MAX - VOLUME_MIN)
+    )
+
+# 0 = mute, 256 = full scale
+volume_gain = (
+    volume_percent * 256 // 100
+)
+
+last_volume_read_time = 0
+last_volume_oled_time = 0
+
+VOLUME_READ_INTERVAL_MS = 8
+VOLUME_OLED_INTERVAL_MS = 80
 
 
 CENTER_X = 31815
@@ -174,7 +215,7 @@ SCALE_DISPLAY = {
 # I2S AUDIO
 # ============================================================
 #
-# Small buffer keeps performance responsive.
+# Small buffer keeps retriggering responsive without mixing guitar voices.
 # ============================================================
 
 audio = I2S(
@@ -378,6 +419,77 @@ down_variation = 0
 
 
 # ============================================================
+# NOTE EFFECTS
+# ============================================================
+#
+# NOTE MODE ONLY:
+#
+# CLEAN  = original sine-wave note
+# OCTAVE = same note one octave higher
+# SYNTH  = brighter triangle-wave synth tone
+#
+# Joystick LEFT / RIGHT changes the note effect.
+#
+# CHORD MODE IS UNCHANGED.
+# ============================================================
+
+NOTE_EFFECTS = [
+    "CLEAN",
+    "OCTAVE",
+    "SYNTH"
+]
+
+note_effect_index = 0
+
+
+def current_note_effect():
+
+    return NOTE_EFFECTS[
+        note_effect_index
+    ]
+
+
+def next_note_effect():
+
+    global note_effect_index
+
+    note_effect_index += 1
+
+    if note_effect_index >= len(
+        NOTE_EFFECTS
+    ):
+
+        note_effect_index = 0
+
+    print(
+        "NOTE FX:",
+        current_note_effect()
+    )
+
+    update_oled()
+
+
+def previous_note_effect():
+
+    global note_effect_index
+
+    note_effect_index -= 1
+
+    if note_effect_index < 0:
+
+        note_effect_index = (
+            len(NOTE_EFFECTS) - 1
+        )
+
+    print(
+        "NOTE FX:",
+        current_note_effect()
+    )
+
+    update_oled()
+
+
+# ============================================================
 # CURRENT CHORD
 # ============================================================
 
@@ -440,8 +552,18 @@ def update_oled(playing=False):
             )
 
         center_text(
-            "# = CHORD",
+            "FX: " + current_note_effect(),
+            38
+        )
+
+        center_text(
+            "VOL: " + str(volume_percent) + "%",
             48
+        )
+
+        center_text(
+            "# = CHORD",
+            56
         )
 
 
@@ -494,21 +616,26 @@ def update_oled(playing=False):
 
         center_text(
             "STRUM: " + strum_direction,
-            28
+            24
+        )
+
+        center_text(
+            "VOL: " + str(volume_percent) + "%",
+            36
         )
 
         if playing:
 
             center_text(
                 "PLAYING",
-                42
+                46
             )
 
         else:
 
             center_text(
                 "PRESS = PLAY",
-                42
+                46
             )
 
         center_text(
@@ -516,17 +643,156 @@ def update_oled(playing=False):
                 selected_scale,
                 selected_scale
             ),
-            54
+            56
         )
 
     oled.show()
 
 
 # ============================================================
+# FILTERED VOLUME READER
+# ============================================================
+
+def service_volume():
+
+    global volume_filtered
+    global volume_percent
+    global volume_gain
+
+    global last_volume_read_time
+    global last_volume_oled_time
+
+
+    now = time.ticks_ms()
+
+
+    # Read the knob very frequently so intentional turns
+    # feel immediate.
+    if time.ticks_diff(
+        now,
+        last_volume_read_time
+    ) < VOLUME_READ_INTERVAL_MS:
+
+        return
+
+
+    last_volume_read_time = now
+
+
+    # A small 4-read average removes ADC spikes without
+    # adding noticeable control lag.
+    total = 0
+
+    for _ in range(4):
+
+        total += volume_adc.read_u16()
+
+
+    average = total // 4
+
+
+    # Adaptive filtering:
+    # - big movement = snap immediately to the knob
+    # - tiny movement = smooth noise while stationary
+    difference = abs(
+        average - volume_filtered
+    )
+
+
+    if difference >= 1200:
+
+        # User is actually turning the knob.
+        volume_filtered = average
+
+    else:
+
+        # Knob is nearly stationary: reject small jitter.
+        volume_filtered = (
+            volume_filtered * 3
+            + average
+        ) // 4
+
+
+    # Endpoint dead zones.
+    if volume_filtered <= VOLUME_MIN:
+
+        new_percent = 0
+
+    elif volume_filtered >= VOLUME_MAX:
+
+        new_percent = 100
+
+    else:
+
+        new_percent = (
+            (volume_filtered - VOLUME_MIN)
+            * 100
+            // (VOLUME_MAX - VOLUME_MIN)
+        )
+
+
+    # 1% hysteresis keeps the reading stable while still
+    # responding almost immediately when the knob moves.
+    force_endpoint = (
+        new_percent == 0
+        or new_percent == 100
+    )
+
+
+    if (
+        force_endpoint
+        or abs(
+            new_percent - volume_percent
+        ) >= 1
+    ):
+
+        if new_percent != volume_percent:
+
+            volume_percent = new_percent
+
+            volume_gain = (
+                volume_percent
+                * 256
+                // 100
+            )
+
+
+            print(
+                "VOLUME:",
+                volume_percent,
+                "%"
+            )
+
+
+            # The AUDIO volume changes immediately because
+            # volume_gain is already updated above.
+            # OLED refresh stays throttled to protect audio.
+            if (
+                not audio_active
+                and current_note_key is None
+                and time.ticks_diff(
+                    now,
+                    last_volume_oled_time
+                ) >= VOLUME_OLED_INTERVAL_MS
+            ):
+
+                update_oled()
+
+                last_volume_oled_time = now
+
+
+# ============================================================
 # CLEAN NOTE ENGINE
 # ============================================================
 
-note_buffers = {}
+note_buffers = {
+    "CLEAN": {},
+    "OCTAVE": {},
+    "SYNTH": {}
+}
+
+note_output_buffer = None
+note_output_view = None
 
 
 def midi_to_frequency(midi):
@@ -541,8 +807,15 @@ def midi_to_frequency(midi):
 
 
 def make_note_buffer(
-    midi
+    midi,
+    effect
 ):
+
+    # OCTAVE raises the note by 12 semitones.
+    if effect == "OCTAVE":
+
+        midi += 12
+
 
     frequency = (
         midi_to_frequency(
@@ -565,44 +838,114 @@ def make_note_buffer(
     )
 
 
+    # Keep at least a few samples in the loop.
+    if samples < 16:
+
+        samples = 16
+
+
     buf = bytearray(
         samples * 4
     )
 
 
-    amplitude = 4000
-
-
-    for i in range(
-        samples
+    # --------------------------------------------------------
+    # CLEAN / OCTAVE
+    # --------------------------------------------------------
+    # Both use a smooth sine wave. OCTAVE changes pitch only.
+    # --------------------------------------------------------
+    if (
+        effect == "CLEAN"
+        or effect == "OCTAVE"
     ):
 
-        phase = (
+        amplitude = 4000
 
-            2
-            * math.pi
-            * cycles
-            * i
-            / samples
-        )
+        for i in range(
+            samples
+        ):
 
+            phase = (
 
-        sample = int(
-
-            amplitude
-            * math.sin(
-                phase
+                2
+                * math.pi
+                * cycles
+                * i
+                / samples
             )
-        )
+
+            sample = int(
+
+                amplitude
+                * math.sin(
+                    phase
+                )
+            )
 
 
-        struct.pack_into(
-            "<hh",
-            buf,
-            i * 4,
-            sample,
-            sample
-        )
+            struct.pack_into(
+                "<hh",
+                buf,
+                i * 4,
+                sample,
+                sample
+            )
+
+
+    # --------------------------------------------------------
+    # SYNTH
+    # --------------------------------------------------------
+    # Triangle wave:
+    # noticeably more electronic than CLEAN,
+    # but smoother and less harsh than a square wave.
+    # --------------------------------------------------------
+    else:
+
+        amplitude = 3600
+
+        for i in range(
+            samples
+        ):
+
+            phase = (
+                (
+                    cycles * i
+                    / samples
+                )
+                % 1.0
+            )
+
+            if phase < 0.25:
+
+                value = (
+                    phase * 4.0
+                )
+
+            elif phase < 0.75:
+
+                value = (
+                    2.0
+                    - phase * 4.0
+                )
+
+            else:
+
+                value = (
+                    phase * 4.0
+                    - 4.0
+                )
+
+            sample = int(
+                amplitude * value
+            )
+
+            struct.pack_into(
+                "<hh",
+                buf,
+                i * 4,
+                sample,
+                sample
+            )
 
 
     return buf
@@ -610,28 +953,63 @@ def make_note_buffer(
 
 def build_notes():
 
+    global note_output_buffer
+    global note_output_view
+
+
     print(
         "Building note mode..."
     )
 
 
-    for key in NOTE_KEYS:
+    for effect in NOTE_EFFECTS:
 
-        name, midi = (
-            NOTE_KEYS[
-                key
-            ]
+        print(
+            "Building note FX:",
+            effect
         )
 
+        for key in NOTE_KEYS:
 
-        note_buffers[
-            key
-        ] = (
-
-            make_note_buffer(
-                midi
+            name, midi = (
+                NOTE_KEYS[
+                    key
+                ]
             )
-        )
+
+
+            note_buffers[
+                effect
+            ][
+                key
+            ] = (
+
+                make_note_buffer(
+                    midi,
+                    effect
+                )
+            )
+
+
+    # One reusable buffer for volume-scaled note playback.
+    max_note_bytes = max(
+
+        len(buf)
+
+        for effect_buffers
+        in note_buffers.values()
+
+        for buf
+        in effect_buffers.values()
+    )
+
+    note_output_buffer = bytearray(
+        max_note_bytes
+    )
+
+    note_output_view = memoryview(
+        note_output_buffer
+    )
 
 
     gc.collect()
@@ -661,7 +1039,7 @@ audio_file = None
 audio_active = False
 
 
-MONO_CHUNK_BYTES = 512
+MONO_CHUNK_BYTES = 256
 
 
 # 512 mono bytes
@@ -787,10 +1165,9 @@ def start_strum():
     audio_active = True
 
 
-    update_oled(
-        playing=True
-    )
-
+    # Do not redraw the OLED here. SSD1306 I2C updates can delay
+    # the attack of a rapid strum. The display is refreshed by
+    # normal chord/direction/volume state changes and at sample end.
 
     print(
         "STRUM:",
@@ -842,8 +1219,7 @@ def service_audio():
     )
 
 
-    # Must contain complete 16-bit samples
-
+    # Must contain complete 16-bit samples.
     if length & 1:
 
         length -= 1
@@ -853,7 +1229,7 @@ def service_audio():
 
 
     # --------------------------------------------------------
-    # MONO 16 BIT -> STEREO 16 BIT
+    # MONO 16-BIT -> VOLUME SCALE -> STEREO 16-BIT
     # --------------------------------------------------------
 
     for i in range(
@@ -862,27 +1238,55 @@ def service_audio():
         2
     ):
 
-        low_byte = data[i]
+        sample = (
+            data[i]
+            | (
+                data[i + 1]
+                << 8
+            )
+        )
 
-        high_byte = data[
-            i + 1
-        ]
+
+        # Convert unsigned 0..65535 representation
+        # into signed -32768..32767.
+        if sample >= 32768:
+
+            sample -= 65536
+
+
+        # Apply smooth 0..100% volume.
+        #
+        # volume_gain:
+        # 0   = mute
+        # 128 = about 50%
+        # 256 = full level
+        sample = (
+            sample
+            * volume_gain
+        ) >> 8
+
+
+        low_byte = (
+            sample & 0xFF
+        )
+
+        high_byte = (
+            (sample >> 8)
+            & 0xFF
+        )
 
 
         stereo_buffer[
             out
         ] = low_byte
 
-
         stereo_buffer[
             out + 1
         ] = high_byte
 
-
         stereo_buffer[
             out + 2
         ] = low_byte
-
 
         stereo_buffer[
             out + 3
@@ -907,10 +1311,57 @@ def play_note_piece(
     buffer
 ):
 
-    # Notes are already stereo.
+    length = len(
+        buffer
+    )
+
+
+    # Scale every signed 16-bit stereo sample
+    # using the same slider volume as Chord Mode.
+    for i in range(
+        0,
+        length,
+        2
+    ):
+
+        sample = (
+            buffer[i]
+            | (
+                buffer[i + 1]
+                << 8
+            )
+        )
+
+
+        if sample >= 32768:
+
+            sample -= 65536
+
+
+        sample = (
+            sample
+            * volume_gain
+        ) >> 8
+
+
+        note_output_buffer[
+            i
+        ] = (
+            sample & 0xFF
+        )
+
+        note_output_buffer[
+            i + 1
+        ] = (
+            (sample >> 8)
+            & 0xFF
+        )
+
 
     audio.write(
-        buffer
+        note_output_view[
+            :length
+        ]
     )
 
 
@@ -1335,10 +1786,35 @@ def read_joystick():
 
 
     # --------------------------------------------------------
+    # NOTE MODE CONTROLS
+    # --------------------------------------------------------
+    # LEFT / RIGHT cycles the 3 note effects.
+    # --------------------------------------------------------
+
+    if mode == "NOTE":
+
+        if (
+            abs(dx) >= abs(dy)
+            and abs(dx) > MOVE_DISTANCE
+            and x_ready
+        ):
+
+            if dx > 0:
+
+                next_note_effect()
+
+            else:
+
+                previous_note_effect()
+
+            x_ready = False
+
+
+    # --------------------------------------------------------
     # CHORD MODE CONTROLS
     # --------------------------------------------------------
 
-    if mode == "CHORD":
+    elif mode == "CHORD":
 
 
         # ====================================================
@@ -1413,7 +1889,7 @@ def read_joystick():
         and time.ticks_diff(
             now,
             last_strum_time
-        ) > 100
+        ) > 60
     ):
 
 
@@ -1451,6 +1927,12 @@ print("# = CHORD MODE")
 print("0 = STOP")
 print()
 
+print("NOTE MODE:")
+print("1-8 = PLAY NOTES")
+print("JOYSTICK LEFT / RIGHT = CHANGE NOTE FX")
+print("NOTE FX: CLEAN / OCTAVE / SYNTH")
+print()
+
 print("CHORD MODE:")
 print("1 = C MAJOR SCALE")
 print("2 = G MAJOR SCALE")
@@ -1468,7 +1950,7 @@ print()
 print("9 = TOGGLE UP / DOWN")
 print()
 
-print("VOLUME CONTROL DISABLED")
+print("VOLUME SLIDER: GP26 / ADC0")
 print()
 
 print("AIRFRET READY")
@@ -1546,6 +2028,13 @@ while True:
 
 
     # ========================================================
+    # VOLUME SLIDER
+    # ========================================================
+
+    service_volume()
+
+
+    # ========================================================
     # JOYSTICK
     # ========================================================
 
@@ -1577,6 +2066,8 @@ while True:
         play_note_piece(
 
             note_buffers[
+                current_note_effect()
+            ][
                 current_note_key
             ]
         )
