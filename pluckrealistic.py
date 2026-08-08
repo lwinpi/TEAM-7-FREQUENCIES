@@ -7,8 +7,21 @@ import gc
 
 
 # ============================================================
-# AIRFRET - HUMANIZED GUITAR STRUM
-# NO POTENTIOMETER / NO VOLUME CONTROL
+# AIRFRET - REALISTIC GUITAR STRUM TEST
+#
+# NO POTENTIOMETER
+# NO VOLUME CONTROL
+#
+# Uses:
+# - real 6-string guitar voicings
+# - Karplus-Strong physical string model
+# - pick-position filtering
+# - per-string damping
+# - slight detuning
+# - irregular strum timing
+# - muted-string scratches
+# - pick transient
+# - subtle guitar-body resonance
 # ============================================================
 
 
@@ -45,6 +58,10 @@ for gpio in COL_GPIOS:
 # JOYSTICK
 # ============================================================
 
+# SW  -> GP18
+# VRx -> GP27
+# VRy -> GP28
+
 joystick_switch = Pin(
     18,
     Pin.IN,
@@ -62,14 +79,14 @@ RESET_DISTANCE = 3000
 
 
 # ============================================================
-# AUDIO
-# ============================================================
-#
-# 22.05 kHz lets us keep a much longer guitar decay
-# without using too much RAM.
+# MAX98357A
 # ============================================================
 
-SAMPLE_RATE = 22050
+# GP10 -> BCLK
+# GP11 -> LRC
+# GP12 -> DIN
+
+SAMPLE_RATE = 44100
 
 audio = I2S(
     0,
@@ -80,12 +97,12 @@ audio = I2S(
     bits=16,
     format=I2S.STEREO,
     rate=SAMPLE_RATE,
-    ibuf=12000
+    ibuf=30000
 )
 
 
 # ============================================================
-# NOTE MODE
+# CLEAN NOTE MODE
 # ============================================================
 
 NOTE_KEYS = {
@@ -156,39 +173,41 @@ SCALES = {
 
 
 # ============================================================
-# REAL GUITAR VOICINGS
+# REAL 6-STRING GUITAR VOICINGS
 # ============================================================
 #
-# Order:
+# Array order:
 #
-# 0 = low E string
-# 1 = A string
-# 2 = D string
-# 3 = G string
-# 4 = B string
-# 5 = high E string
+# string 6 -> low E
+# string 5 -> A
+# string 4 -> D
+# string 3 -> G
+# string 2 -> B
+# string 1 -> high E
 #
-# None = muted
+# None = muted string
+#
+# Example C major:
+#
+# x 3 2 0 1 0
+#
+# None, C3, E3, G3, C4, E4
 # ============================================================
 
 GUITAR_CHORDS = {
 
-    # x32010
     "C_MAJOR": [
         None, 48, 52, 55, 60, 64
     ],
 
-    # xx0231
     "D_MINOR": [
         None, None, 50, 57, 62, 65
     ],
 
-    # 022000
     "E_MINOR": [
         40, 47, 52, 55, 59, 64
     ],
 
-    # 133211
     "F_MAJOR": [
         41, 48, 53, 57, 60, 65
     ],
@@ -197,7 +216,6 @@ GUITAR_CHORDS = {
         43, 47, 50, 55, 59, 67
     ],
 
-    # x02210
     "A_MINOR": [
         None, 45, 52, 57, 60, 64
     ],
@@ -210,7 +228,6 @@ GUITAR_CHORDS = {
         None, 47, 54, 59, 62, 66
     ],
 
-    # xx0232
     "D_MAJOR": [
         None, None, 50, 57, 62, 66
     ],
@@ -234,18 +251,14 @@ GUITAR_CHORDS = {
 
 
 # ============================================================
-# STATE
+# SYSTEM STATE
 # ============================================================
 
 mode = "NOTE"
 
 selected_scale = "C_MAJOR"
-
 chord_index = 0
-
 inversion = 0
-
-strum_direction = "DOWN"
 
 previous_keys = set()
 
@@ -255,20 +268,17 @@ x_ready = True
 y_ready = True
 
 previous_switch = 1
-
 last_strum_time = 0
 
 
 # ============================================================
-# MIDI FREQUENCY
+# MIDI -> FREQUENCY
 # ============================================================
 
 def midi_to_frequency(midi):
 
     return 440.0 * (
-        2 ** (
-            (midi - 69) / 12
-        )
+        2 ** ((midi - 69) / 12)
     )
 
 
@@ -282,63 +292,18 @@ def current_chord():
 
 
 # ============================================================
-# RANDOM HUMANIZATION
-# ============================================================
-
-random_state = 0x42A71C93
-
-
-def next_noise():
-
-    global random_state
-
-    random_state = (
-        random_state * 1664525
-        + 1013904223
-    ) & 0xFFFFFFFF
-
-    value = (
-        (random_state >> 16)
-        & 0xFFFF
-    )
-
-    return (
-        value - 32768
-    )
-
-
-def rand_int(low, high):
-
-    if high <= low:
-
-        return low
-
-    value = (
-        next_noise()
-        + 32768
-    )
-
-    return (
-        low
-        + value
-        * (high - low + 1)
-        // 65536
-    )
-
-
-# ============================================================
-# LONG GUITAR BUFFER
+# CHORD BUFFER
 # ============================================================
 #
-# 650 ms
+# Allocate ONE buffer and reuse it.
 #
-# 22050 × 0.650 × 4
-# ≈ 57 KB
+# 300 ms:
 #
-# Allocate it BEFORE smaller buffers.
+# 44100 * .300 * 4
+# = 52,920 bytes
 # ============================================================
 
-CHORD_DURATION_MS = 650
+CHORD_DURATION_MS = 300
 
 CHORD_SAMPLES = (
     SAMPLE_RATE
@@ -347,12 +312,11 @@ CHORD_SAMPLES = (
 )
 
 CHORD_BYTES = (
-    CHORD_SAMPLES
-    * 4
+    CHORD_SAMPLES * 4
 )
 
-print()
 
+print()
 print(
     "Allocating guitar buffer:",
     CHORD_BYTES,
@@ -365,9 +329,7 @@ current_chord_buffer = bytearray(
     CHORD_BYTES
 )
 
-print(
-    "Guitar buffer ready."
-)
+print("Guitar buffer ready.")
 
 
 # ============================================================
@@ -379,10 +341,8 @@ note_buffers = {}
 
 def make_clean_note(midi):
 
-    frequency = (
-        midi_to_frequency(
-            midi
-        )
+    frequency = midi_to_frequency(
+        midi
     )
 
     cycles = 4
@@ -399,6 +359,7 @@ def make_clean_note(midi):
         samples * 4
     )
 
+    # Same simple clean tone approach
     amplitude = 4000
 
     for i in range(samples):
@@ -413,9 +374,7 @@ def make_clean_note(midi):
 
         sample = int(
             amplitude
-            * math.sin(
-                phase
-            )
+            * math.sin(phase)
         )
 
         struct.pack_into(
@@ -432,20 +391,14 @@ def make_clean_note(midi):
 def build_notes():
 
     print()
-    print(
-        "Building clean notes..."
-    )
+    print("Building clean notes...")
 
     for key in NOTE_KEYS:
 
-        name, midi = (
-            NOTE_KEYS[key]
-        )
+        name, midi = NOTE_KEYS[key]
 
         note_buffers[key] = (
-            make_clean_note(
-                midi
-            )
+            make_clean_note(midi)
         )
 
         print(
@@ -455,11 +408,120 @@ def build_notes():
 
     gc.collect()
 
-    print(
-        "Notes ready."
-    )
-
+    print("Notes ready.")
     print()
+
+
+# ============================================================
+# RANDOM GENERATOR
+# ============================================================
+#
+# Used for string displacement and pick noise.
+# ============================================================
+
+random_state = 0x45ABCDEF
+
+
+def next_noise():
+
+    global random_state
+
+    random_state = (
+        random_state * 1664525
+        + 1013904223
+    ) & 0xFFFFFFFF
+
+    value = (
+        random_state >> 16
+    ) & 0xFFFF
+
+    return value - 32768
+
+
+# ============================================================
+# GUITAR STRING CHARACTER
+# ============================================================
+
+# Tiny tuning imperfections.
+# Real guitar strings are not mathematically perfect.
+
+DETUNE_CENTS = [
+    -1.2,
+     0.8,
+    -0.6,
+     0.5,
+    -0.4,
+     0.7
+]
+
+
+# Pick position as fraction of string length.
+#
+# Different positions alter harmonic content.
+
+PICK_POSITION = [
+    0.24,
+    0.22,
+    0.21,
+    0.19,
+    0.18,
+    0.17
+]
+
+
+# Initial strength.
+
+STRING_LEVEL = [
+    8000,
+    7700,
+    7400,
+    7100,
+    6800,
+    6500
+]
+
+
+# Feedback damping.
+#
+# Each string decays slightly differently.
+
+STRING_DAMPING = [
+    32728,
+    32725,
+    32720,
+    32715,
+    32710,
+    32705
+]
+
+
+# ============================================================
+# STRUM TIMING
+# ============================================================
+#
+# NOT perfectly even.
+#
+# A real hand doesn't hit every string exactly 7ms apart.
+# ============================================================
+
+STRUM_TIMES_MS = [
+    0,
+    6,
+    13,
+    21,
+    30,
+    40
+]
+
+STRUM_STARTS = []
+
+for delay_ms in STRUM_TIMES_MS:
+
+    STRUM_STARTS.append(
+        SAMPLE_RATE
+        * delay_ms
+        // 1000
+    )
 
 
 # ============================================================
@@ -472,13 +534,15 @@ def get_guitar_shape():
         current_chord()
     ][:]
 
+
     if inversion == 0:
 
         return shape
 
 
-    active_positions = []
+    # Find active notes
 
+    active_positions = []
     active_notes = []
 
 
@@ -486,27 +550,29 @@ def get_guitar_shape():
 
         if shape[i] is not None:
 
-            active_positions.append(
-                i
-            )
+            active_positions.append(i)
 
             active_notes.append(
                 shape[i]
             )
 
 
+    # Move lowest note(s) up one octave
+
     for n in range(inversion):
 
         if len(active_notes) > 0:
 
-            first = active_notes.pop(0)
+            lowest = active_notes.pop(0)
 
             active_notes.append(
-                first + 12
+                lowest + 12
             )
 
             active_notes.sort()
 
+
+    # Put them back on the active physical strings
 
     result = [
         None,
@@ -531,92 +597,26 @@ def get_guitar_shape():
 
 
 # ============================================================
-# PHYSICAL STRING CHARACTER
-# ============================================================
-
-# Each physical guitar string is slightly different.
-
-BASE_DETUNE = [
-    -11,
-    7,
-    -5,
-    4,
-    -3,
-    6
-]
-
-# Units above are tenths of a cent.
-
-
-BASE_PICK_POSITION = [
-    24,
-    22,
-    21,
-    19,
-    18,
-    17
-]
-
-
-BASE_LEVEL = [
-    7600,
-    7400,
-    7200,
-    6900,
-    6600,
-    6300
-]
-
-
-# Lower strings ring longer.
-
-BASE_DAMPING = [
-    32746,
-    32744,
-    32741,
-    32738,
-    32734,
-    32730
-]
-
-
-# ============================================================
-# CREATE PHYSICAL STRING
+# CREATE ONE PHYSICAL GUITAR STRING
 # ============================================================
 
 def create_string(
     midi,
-    string_number,
-    stroke_strength
+    string_number
 ):
 
-    frequency = (
-        midi_to_frequency(
-            midi
-        )
+    frequency = midi_to_frequency(
+        midi
     )
 
 
     # --------------------------------------------------------
-    # Tiny tuning imperfection
+    # SMALL REALISTIC DETUNE
     # --------------------------------------------------------
 
-    cents_tenths = (
-        BASE_DETUNE[
-            string_number
-        ]
-        + rand_int(
-            -6,
-            6
-        )
-    )
-
-
-    cents = (
-        cents_tenths
-        / 10.0
-    )
-
+    cents = DETUNE_CENTS[
+        string_number
+    ]
 
     frequency = (
         frequency
@@ -629,19 +629,31 @@ def create_string(
 
 
     # --------------------------------------------------------
-    # String delay length
+    # KARPLUS-STRONG DELAY LENGTH
+    # --------------------------------------------------------
+    #
+    # The averaging filter introduces approximately
+    # half a sample of additional delay.
     # --------------------------------------------------------
 
-    period = int(
+    exact_period = (
         SAMPLE_RATE
         / frequency
+        - 0.5
+    )
+
+    period = int(
+        exact_period + 0.5
     )
 
 
     if period < 4:
-
         period = 4
 
+
+    # --------------------------------------------------------
+    # INITIAL RANDOM STRING DISPLACEMENT
+    # --------------------------------------------------------
 
     ring = array(
         "h",
@@ -649,97 +661,29 @@ def create_string(
     )
 
 
-    # --------------------------------------------------------
-    # Pick strength
-    # --------------------------------------------------------
-
-    level = (
-        BASE_LEVEL[
-            string_number
-        ]
-        * stroke_strength
-        // 100
-    )
-
-
-    level += rand_int(
-        -260,
-        260
-    )
-
-
-    # --------------------------------------------------------
-    # Picked-string excitation
-    #
-    # Filtered noise sounds less like hiss and
-    # more like a real string being struck.
-    # --------------------------------------------------------
-
-    last1 = 0
-    last2 = 0
+    level = STRING_LEVEL[
+        string_number
+    ]
 
 
     for i in range(period):
 
-        raw = next_noise()
-
-
-        excitation = (
-            raw * 5
-            + last1 * 3
-            + last2 * 2
-        ) // 10
-
-
-        last2 = last1
-        last1 = raw
-
-
         value = (
-            excitation
+            next_noise()
             * level
             // 32768
         )
-
-
-        if value > 32767:
-
-            value = 32767
-
-        elif value < -32768:
-
-            value = -32768
-
 
         ring[i] = value
 
 
     # --------------------------------------------------------
-    # Pick position filtering
+    # PICK POSITION FILTER
     # --------------------------------------------------------
-
-    pick_percent = (
-        BASE_PICK_POSITION[
-            string_number
-        ]
-        + rand_int(
-            -2,
-            2
-        )
-    )
-
-
-    pick_delay = (
-        period
-        * pick_percent
-        // 100
-    )
-
-
-    if pick_delay < 1:
-
-        pick_delay = 1
-
+    #
+    # This creates harmonic notches similar to plucking
+    # a real string at a particular physical location.
+    # --------------------------------------------------------
 
     original = array(
         "h",
@@ -747,20 +691,38 @@ def create_string(
     )
 
 
+    pick_delay = int(
+        period
+        * PICK_POSITION[
+            string_number
+        ]
+    )
+
+
+    if pick_delay < 1:
+        pick_delay = 1
+
+
     for i in range(period):
 
-        other = (
+        other_index = (
             i - pick_delay
         ) % period
 
 
         value = (
             original[i]
-            - original[other]
-            * 52
-            // 100
+            - (
+                original[
+                    other_index
+                ]
+                * 55
+                // 100
+            )
         )
 
+
+        # Safety
 
         if value > 32767:
 
@@ -777,30 +739,23 @@ def create_string(
     original = None
 
 
-    damping = (
-        BASE_DAMPING[
-            string_number
-        ]
-        + rand_int(
-            -4,
-            4
-        )
-    )
-
-
     return [
         ring,
         0,
         period,
-        damping
+        STRING_DAMPING[
+            string_number
+        ]
     ]
 
 
 # ============================================================
-# NEXT PHYSICAL STRING SAMPLE
+# NEXT STRING SAMPLE
 # ============================================================
 
-def get_string_sample(string):
+def get_string_sample(
+    string
+):
 
     ring = string[0]
 
@@ -811,9 +766,7 @@ def get_string_sample(string):
     damping = string[3]
 
 
-    next_index = (
-        index + 1
-    )
+    next_index = index + 1
 
 
     if next_index >= length:
@@ -825,14 +778,16 @@ def get_string_sample(string):
         index
     ]
 
-
     next_value = ring[
         next_index
     ]
 
 
     # --------------------------------------------------------
-    # Karplus-Strong vibrating-string loop
+    # STRING ENERGY FEEDBACK
+    # --------------------------------------------------------
+    #
+    # This is the actual Karplus-Strong vibrating-string loop.
     # --------------------------------------------------------
 
     filtered = (
@@ -844,8 +799,11 @@ def get_string_sample(string):
     filtered = (
         filtered
         * damping
-    ) >> 15
+        >> 15
+    )
 
+
+    # Safety
 
     if filtered > 32767:
 
@@ -870,86 +828,19 @@ def get_string_sample(string):
 
 
 # ============================================================
-# HUMAN STRUM TIMING
+# BODY RESONANCE BUFFERS
 # ============================================================
 #
-# Each preparation has slightly different timing.
-#
-# DOWN:
-# low E -> high E
-#
-# UP:
-# high E -> low E
+# Very small delayed reflections add a little bit of
+# "wood/body" instead of totally dry electronic strings.
 # ============================================================
 
-def make_strum_starts(
-    direction
-):
-
-    starts = [
-        0,
-        0,
-        0,
-        0,
-        0,
-        0
-    ]
-
-
-    if direction == "DOWN":
-
-        order = [
-            0, 1, 2, 3, 4, 5
-        ]
-
-        minimum_gap = 5
-        maximum_gap = 10
-
-
-    else:
-
-        order = [
-            5, 4, 3, 2, 1, 0
-        ]
-
-        minimum_gap = 4
-        maximum_gap = 8
-
-
-    cursor_ms = 0
-
-
-    for position in range(6):
-
-        string_number = (
-            order[position]
-        )
-
-
-        if position > 0:
-
-            cursor_ms += (
-                rand_int(
-                    minimum_gap,
-                    maximum_gap
-                )
-            )
-
-
-        starts[
-            string_number
-        ] = (
-            SAMPLE_RATE
-            * cursor_ms
-            // 1000
-        )
-
-
-    return starts
+BODY_DELAY_1 = 149
+BODY_DELAY_2 = 257
 
 
 # ============================================================
-# PREPARE HUMANIZED GUITAR STRUM
+# PREPARE REALISTIC GUITAR STRUM
 # ============================================================
 
 def prepare_current_chord():
@@ -957,42 +848,10 @@ def prepare_current_chord():
     shape = get_guitar_shape()
 
 
-    # --------------------------------------------------------
-    # Whole-hand strength variation
-    # --------------------------------------------------------
-
-    if strum_direction == "DOWN":
-
-        stroke_strength = (
-            rand_int(
-                96,
-                108
-            )
-        )
-
-    else:
-
-        stroke_strength = (
-            rand_int(
-                82,
-                98
-            )
-        )
-
-
-    starts = (
-        make_strum_starts(
-            strum_direction
-        )
-    )
-
-
     print()
-
     print(
-        "PREPARING:",
-        current_chord(),
-        strum_direction
+        "PREPARING GUITAR:",
+        current_chord()
     )
 
     print(
@@ -1002,7 +861,7 @@ def prepare_current_chord():
 
 
     # --------------------------------------------------------
-    # Create 6 physical strings
+    # CREATE STRING MODELS
     # --------------------------------------------------------
 
     strings = [
@@ -1017,69 +876,54 @@ def prepare_current_chord():
 
     for string_number in range(6):
 
-        midi = (
-            shape[
-                string_number
-            ]
-        )
+        midi = shape[
+            string_number
+        ]
 
 
         if midi is not None:
 
             strings[
                 string_number
-            ] = (
-                create_string(
-                    midi,
-                    string_number,
-                    stroke_strength
-                )
+            ] = create_string(
+                midi,
+                string_number
             )
 
 
     gc.collect()
 
 
-    # ========================================================
-    # GUITAR BODY MEMORY
-    # ========================================================
+    # --------------------------------------------------------
+    # BODY REFLECTION MEMORY
+    # --------------------------------------------------------
 
-    body_delay1 = array(
+    body1 = array(
         "h",
-        [0] * 71
+        [0] * BODY_DELAY_1
     )
 
-
-    body_delay2 = array(
+    body2 = array(
         "h",
-        [0] * 149
+        [0] * BODY_DELAY_2
     )
-
 
     body_index1 = 0
     body_index2 = 0
 
-    body_low = 0
 
+    # About 1.2 ms pick click
 
-    # --------------------------------------------------------
-    # Pick attack
-    # --------------------------------------------------------
-
-    pick_samples = max(
-        1,
+    PICK_SAMPLES = (
         SAMPLE_RATE
-        * 9
+        * 12
         // 10000
     )
 
 
-    # --------------------------------------------------------
-    # Muted string scrape
-    # --------------------------------------------------------
+    # Muted string scrape lasts about 4 ms
 
-    mute_samples = max(
-        1,
+    MUTE_SAMPLES = (
         SAMPLE_RATE
         * 4
         // 1000
@@ -1087,60 +931,26 @@ def prepare_current_chord():
 
 
     # --------------------------------------------------------
-    # Small fret/contact transient
+    # RENDER CHORD
     # --------------------------------------------------------
-
-    fret_noise_samples = max(
-        1,
-        SAMPLE_RATE
-        * 2
-        // 1000
-    )
-
-
-    # --------------------------------------------------------
-    # Different strength for every string
-    # --------------------------------------------------------
-
-    attack_scales = []
-
-
-    for string_number in range(6):
-
-        attack_scales.append(
-            rand_int(
-                88,
-                112
-            )
-        )
-
-
-    # ========================================================
-    # RENDER ENTIRE GUITAR PERFORMANCE
-    # ========================================================
 
     for sample_index in range(
         CHORD_SAMPLES
     ):
 
-
         mixed = 0
-
         active_count = 0
 
 
         # ====================================================
-        # SIX STRINGS
+        # SIX PHYSICAL STRINGS
         # ====================================================
 
         for string_number in range(6):
 
-
-            start = (
-                starts[
-                    string_number
-                ]
-            )
+            start = STRUM_STARTS[
+                string_number
+            ]
 
 
             if sample_index < start:
@@ -1154,40 +964,35 @@ def prepare_current_chord():
             )
 
 
-            string = (
-                strings[
-                    string_number
-                ]
-            )
+            string = strings[
+                string_number
+            ]
 
 
             # =================================================
-            # MUTED STRING SOUND
+            # MUTED STRING SCRAPE
             # =================================================
 
             if string is None:
 
+                if age < MUTE_SAMPLES:
 
-                if age < mute_samples:
+                    strength = (
+                        MUTE_SAMPLES
+                        - age
+                    )
+
 
                     scratch = (
                         next_noise()
+                        * strength
+                        // MUTE_SAMPLES
                     )
 
 
                     scratch = (
                         scratch
-                        * (
-                            mute_samples
-                            - age
-                        )
-                        // mute_samples
-                    )
-
-
-                    scratch = (
-                        scratch
-                        * 180
+                        * 350
                         // 32768
                     )
 
@@ -1199,98 +1004,46 @@ def prepare_current_chord():
 
 
             # =================================================
-            # PHYSICAL STRING
+            # VIBRATING STRING
             # =================================================
 
-            value = (
-                get_string_sample(
-                    string
+            value = get_string_sample(
+                string
+            )
+
+
+            # =================================================
+            # PICK TRANSIENT
+            # =================================================
+            #
+            # Real plectrum contact produces a very short
+            # broadband transient before the pitched string
+            # becomes dominant.
+            # =================================================
+
+            if age < PICK_SAMPLES:
+
+                remaining = (
+                    PICK_SAMPLES
+                    - age
                 )
-            )
 
-
-            # -------------------------------------------------
-            # Human strength variation
-            # -------------------------------------------------
-
-            value = (
-                value
-                * attack_scales[
-                    string_number
-                ]
-                // 100
-            )
-
-
-            # =================================================
-            # PICK CLICK
-            # =================================================
-
-            if age < pick_samples:
 
                 click = (
                     next_noise()
+                    * remaining
+                    // PICK_SAMPLES
                 )
 
 
                 click = (
                     click
-                    * (
-                        pick_samples
-                        - age
-                    )
-                    // pick_samples
-                )
-
-
-                # High strings get slightly brighter pick attack.
-
-                click_strength = (
-                    240
-                    + string_number
-                    * 30
-                )
-
-
-                click = (
-                    click
-                    * click_strength
+                    * 650
                     // 32768
                 )
 
 
                 value += click
-
-
-            # =================================================
-            # TINY FRET / CONTACT NOISE
-            # =================================================
-
-            if age < fret_noise_samples:
-
-                fret = (
-                    next_noise()
-                )
-
-
-                fret = (
-                    fret
-                    * (
-                        fret_noise_samples
-                        - age
-                    )
-                    // fret_noise_samples
-                )
-
-
-                fret = (
-                    fret
-                    * 70
-                    // 32768
-                )
-
-
-                value += fret
 
 
             mixed += value
@@ -1306,10 +1059,9 @@ def prepare_current_chord():
 
             mixed = (
                 mixed
-                * 54
+                * 55
                 // 100
             )
-
 
         elif active_count >= 3:
 
@@ -1320,39 +1072,17 @@ def prepare_current_chord():
             )
 
 
-        elif active_count == 2:
-
-            mixed = (
-                mixed
-                * 82
-                // 100
-            )
-
-
         # ====================================================
-        # GUITAR BODY COLOR
+        # GUITAR BODY REFLECTION
         # ====================================================
 
-        reflection1 = (
-            body_delay1[
-                body_index1
-            ]
-        )
+        reflection1 = body1[
+            body_index1
+        ]
 
-
-        reflection2 = (
-            body_delay2[
-                body_index2
-            ]
-        )
-
-
-        # Warm body component
-
-        body_low = (
-            body_low * 7
-            + mixed
-        ) // 8
+        reflection2 = body2[
+            body_index2
+        ]
 
 
         dry = mixed
@@ -1360,67 +1090,46 @@ def prepare_current_chord():
 
         mixed = (
             dry
-
-            + reflection1
-            * 10
-            // 100
-
-            + reflection2
-            * 6
-            // 100
-
-            + body_low
-            * 8
-            // 100
+            + reflection1 * 12 // 100
+            + reflection2 * 7 // 100
         )
 
 
-        # ----------------------------------------------------
-        # Feed body resonances
-        # ----------------------------------------------------
+        # Store dry sound into body delay
 
-        stored = (
-            dry
-            * 72
-            // 100
-        )
+        if dry > 32767:
 
+            dry_store = 32767
 
-        if stored > 32767:
+        elif dry < -32768:
 
-            stored = 32767
+            dry_store = -32768
 
-        elif stored < -32768:
+        else:
 
-            stored = -32768
+            dry_store = dry
 
 
-        body_delay1[
+        body1[
             body_index1
-        ] = stored
+        ] = dry_store
 
 
-        body_delay2[
+        body2[
             body_index2
-        ] = stored
+        ] = dry_store
 
 
         body_index1 += 1
 
-
-        if body_index1 >= len(
-            body_delay1
-        ):
+        if body_index1 >= BODY_DELAY_1:
 
             body_index1 = 0
 
 
         body_index2 += 1
 
-
-        if body_index2 >= len(
-            body_delay2
-        ):
+        if body_index2 >= BODY_DELAY_2:
 
             body_index2 = 0
 
@@ -1429,8 +1138,7 @@ def prepare_current_chord():
         # END FADE
         # ====================================================
 
-        fade_samples = 900
-
+        fade_length = 1000
 
         remaining = (
             CHORD_SAMPLES
@@ -1438,17 +1146,17 @@ def prepare_current_chord():
         )
 
 
-        if remaining < fade_samples:
+        if remaining < fade_length:
 
             mixed = (
                 mixed
                 * remaining
-                // fade_samples
+                // fade_length
             )
 
 
         # ====================================================
-        # PROTECTION
+        # SAFETY CLIPPING
         # ====================================================
 
         if mixed > 26000:
@@ -1461,7 +1169,7 @@ def prepare_current_chord():
 
 
         # ====================================================
-        # STEREO PCM
+        # WRITE 16-BIT STEREO PCM
         # ====================================================
 
         struct.pack_into(
@@ -1474,18 +1182,15 @@ def prepare_current_chord():
 
 
     strings = None
-
-    body_delay1 = None
-
-    body_delay2 = None
+    body1 = None
+    body2 = None
 
     gc.collect()
 
 
     print(
         "READY:",
-        current_chord(),
-        strum_direction
+        current_chord()
     )
 
     print()
@@ -1501,42 +1206,33 @@ def play_buffer(buffer):
         buffer
     )
 
-    total = len(
-        view
-    )
+    total = len(view)
 
     position = 0
 
-    chunk_size = 4096
+    CHUNK_SIZE = 4096
 
 
     while position < total:
 
         end = min(
-            position
-            + chunk_size,
+            position + CHUNK_SIZE,
             total
         )
 
 
-        chunk = (
-            view[
-                position:end
-            ]
-        )
+        chunk = view[
+            position:end
+        ]
 
 
         sent = 0
 
 
-        while sent < len(
-            chunk
-        ):
+        while sent < len(chunk):
 
             written = audio.write(
-                chunk[
-                    sent:
-                ]
+                chunk[sent:]
             )
 
 
@@ -1567,10 +1263,12 @@ def strum_chord():
 
     print(
         "STRUM:",
-        strum_direction,
         current_chord()
     )
 
+
+    # Instant playback.
+    # Chord was already created when selected.
 
     play_buffer(
         current_chord_buffer
@@ -1578,7 +1276,7 @@ def strum_chord():
 
 
 # ============================================================
-# STATUS
+# CHORD DISPLAY
 # ============================================================
 
 def show_current():
@@ -1598,14 +1296,9 @@ def show_current():
         inversion
     )
 
-    print(
-        "STRUM:",
-        strum_direction
-    )
-
 
 # ============================================================
-# SELECT SCALE
+# SCALE
 # ============================================================
 
 def select_scale(scale):
@@ -1739,34 +1432,7 @@ def decrease_inversion():
 
 
 # ============================================================
-# STRUM DIRECTION
-# ============================================================
-
-def toggle_strum_direction():
-
-    global strum_direction
-
-
-    if strum_direction == "DOWN":
-
-        strum_direction = "UP"
-
-    else:
-
-        strum_direction = "DOWN"
-
-
-    print(
-        "STRUM DIRECTION:",
-        strum_direction
-    )
-
-
-    prepare_current_chord()
-
-
-# ============================================================
-# KEYPAD
+# KEYPAD SCANNER
 # ============================================================
 
 def scan_keypad():
@@ -1795,7 +1461,6 @@ def scan_keypad():
                 column_index
             ].value() == 0:
 
-
                 pressed.add(
                     KEY_LAYOUT[
                         row_index
@@ -1823,9 +1488,7 @@ def handle_key_press(key):
     global current_note_key
 
 
-    # --------------------------------------------------------
-    # NOTE MODE
-    # --------------------------------------------------------
+    # * = NOTE MODE
 
     if key == "*":
 
@@ -1840,9 +1503,7 @@ def handle_key_press(key):
         return
 
 
-    # --------------------------------------------------------
-    # CHORD MODE
-    # --------------------------------------------------------
+    # # = CHORD MODE
 
     if key == "#":
 
@@ -1859,9 +1520,7 @@ def handle_key_press(key):
         return
 
 
-    # --------------------------------------------------------
-    # STOP
-    # --------------------------------------------------------
+    # 0 = STOP
 
     if key == "0":
 
@@ -1874,16 +1533,13 @@ def handle_key_press(key):
         return
 
 
-    # --------------------------------------------------------
     # NOTE MODE
-    # --------------------------------------------------------
 
     if mode == "NOTE":
 
         if key in NOTE_KEYS:
 
             current_note_key = key
-
 
             print(
                 "NOTE:",
@@ -1893,12 +1549,9 @@ def handle_key_press(key):
             )
 
 
-    # --------------------------------------------------------
     # CHORD MODE
-    # --------------------------------------------------------
 
     elif mode == "CHORD":
-
 
         if key in SCALE_KEYS:
 
@@ -1907,11 +1560,6 @@ def handle_key_press(key):
                     key
                 ]
             )
-
-
-        elif key == "9":
-
-            toggle_strum_direction()
 
 
 # ============================================================
@@ -1927,29 +1575,20 @@ def read_joystick():
     global last_strum_time
 
 
-    x = (
-        joystick_x.read_u16()
-    )
-
-
-    y = (
-        joystick_y.read_u16()
-    )
+    x = joystick_x.read_u16()
+    y = joystick_y.read_u16()
 
 
     dx = (
         x - CENTER_X
     )
 
-
     dy = (
         y - CENTER_Y
     )
 
 
-    # --------------------------------------------------------
-    # RE-ARM
-    # --------------------------------------------------------
+    # Re-arm
 
     if abs(dx) < RESET_DISTANCE:
 
@@ -1961,21 +1600,18 @@ def read_joystick():
         y_ready = True
 
 
-    # --------------------------------------------------------
     # CHORD MODE
-    # --------------------------------------------------------
 
     if mode == "CHORD":
 
 
-        # LEFT / RIGHT = CHORD
+        # LEFT / RIGHT
 
         if (
             abs(dx) >= abs(dy)
             and abs(dx) > MOVE_DISTANCE
             and x_ready
         ):
-
 
             if dx > 0:
 
@@ -1989,14 +1625,13 @@ def read_joystick():
             x_ready = False
 
 
-        # UP / DOWN = INVERSION
+        # UP / DOWN
 
         elif (
             abs(dy) > abs(dx)
             and abs(dy) > MOVE_DISTANCE
             and y_ready
         ):
-
 
             if dy > 0:
 
@@ -2010,36 +1645,24 @@ def read_joystick():
             y_ready = False
 
 
-    # --------------------------------------------------------
     # JOYSTICK PRESS = STRUM
-    # --------------------------------------------------------
 
-    switch = (
-        joystick_switch.value()
-    )
+    switch = joystick_switch.value()
 
-
-    now = (
-        time.ticks_ms()
-    )
+    now = time.ticks_ms()
 
 
     if (
         mode == "CHORD"
-
         and previous_switch == 1
-
         and switch == 0
-
         and time.ticks_diff(
             now,
             last_strum_time
         ) > 180
     ):
 
-
         strum_chord()
-
 
         last_strum_time = now
 
@@ -2054,21 +1677,21 @@ def read_joystick():
 build_notes()
 
 
+print()
 print(
-    "Creating first humanized C major..."
+    "Creating first realistic C major..."
 )
-
 
 prepare_current_chord()
 
 
 # ============================================================
-# STARTUP MESSAGE
+# STARTUP
 # ============================================================
 
 print()
 print("================================")
-print(" AIRFRET HUMAN GUITAR STRUM")
+print(" AIRFRET REAL GUITAR STRUM TEST")
 print("================================")
 print()
 
@@ -2077,7 +1700,7 @@ print("# = CHORD MODE")
 print("0 = STOP")
 print()
 
-print("NOTE MODE")
+print("NOTE MODE:")
 print("1 = C4")
 print("2 = D4")
 print("3 = E4")
@@ -2088,27 +1711,24 @@ print("7 = B4")
 print("8 = C5")
 print()
 
-print("CHORD MODE")
-print("1 = C MAJOR SCALE")
-print("2 = G MAJOR SCALE")
-print("3 = A MINOR SCALE")
-print("4 = D MINOR SCALE")
+print("CHORD MODE:")
+print("1 = C Major scale")
+print("2 = G Major scale")
+print("3 = A Minor scale")
+print("4 = D Minor scale")
 print()
 
-print("9 = SWITCH DOWN / UP STRUM")
+print("JOYSTICK:")
+print("LEFT / RIGHT = chord")
+print("UP / DOWN = inversion")
+print("PRESS = guitar strum")
 print()
 
-print("JOYSTICK")
-print("LEFT / RIGHT = CHORD")
-print("UP / DOWN = INVERSION")
-print("PRESS = STRUM")
-print()
-
-print("VOLUME CONTROL DISABLED")
-print("GP26 NOT USED")
+print("VOLUME/POTENTIOMETER DISABLED")
 print()
 
 print("AIRFRET READY")
+print()
 
 
 # ============================================================
@@ -2118,13 +1738,9 @@ print("AIRFRET READY")
 while True:
 
 
-    # --------------------------------------------------------
     # KEYPAD
-    # --------------------------------------------------------
 
-    current_keys = (
-        scan_keypad()
-    )
+    current_keys = scan_keypad()
 
 
     newly_pressed = (
@@ -2148,12 +1764,10 @@ while True:
 
     for key in newly_released:
 
-
         if (
             mode == "NOTE"
             and key == current_note_key
         ):
-
 
             print(
                 "NOTE OFF:",
@@ -2162,32 +1776,23 @@ while True:
                 ][0]
             )
 
-
             current_note_key = None
 
 
-    previous_keys = (
-        current_keys
-    )
+    previous_keys = current_keys
 
 
-    # --------------------------------------------------------
     # JOYSTICK
-    # --------------------------------------------------------
 
     read_joystick()
 
 
-    # --------------------------------------------------------
-    # NOTE MODE
-    # --------------------------------------------------------
+    # CLEAN NOTE PLAYBACK
 
     if (
         mode == "NOTE"
-        and current_note_key
-        is not None
+        and current_note_key is not None
     ):
-
 
         play_buffer(
             note_buffers[
