@@ -169,6 +169,363 @@ oled = ssd1306.SSD1306_I2C(
 )
 
 
+# ============================================================
+# RIGHT-HAND MPU6050 GYRO STRUMMING
+# ============================================================
+#
+# The MPU6050 shares the OLED I2C bus:
+#
+# MPU VCC -> Pico 3V3
+# MPU GND -> Pico GND
+# MPU SDA -> GP20
+# MPU SCL -> GP21
+#
+# Joystick LEFT / RIGHT still changes chords.
+# Joystick UP / DOWN no longer strums.
+#
+# AUTO chooses whichever gyro axis has the strongest motion.
+# If you later want to lock it to one axis, change to:
+# "X", "Y", or "Z".
+# ============================================================
+
+GYRO_AXIS = "AUTO"
+
+# If physical UP and DOWN are backwards:
+# either set this True or press keypad 9 while in Chord Mode.
+GYRO_REVERSE = False
+
+GYRO_TRIGGER_DPS = 140
+GYRO_RESET_DPS = 45
+
+GYRO_READ_INTERVAL_MS = 8
+GYRO_LOCKOUT_MS = 85
+
+MPU_PWR_MGMT_1 = 0x6B
+MPU_GYRO_CONFIG = 0x1B
+MPU_GYRO_XOUT_H = 0x43
+
+gyro_enabled = False
+gyro_addr = None
+
+gyro_buffer = bytearray(6)
+
+gyro_bias_x = 0
+gyro_bias_y = 0
+gyro_bias_z = 0
+
+gyro_armed = True
+last_gyro_read_time = 0
+last_gyro_strum_time = 0
+
+
+def gyro_signed16(high, low):
+
+    value = (
+        high << 8
+    ) | low
+
+    if value & 0x8000:
+
+        value -= 65536
+
+    return value
+
+
+def read_gyro_raw():
+
+    oled_i2c.readfrom_mem_into(
+        gyro_addr,
+        MPU_GYRO_XOUT_H,
+        gyro_buffer
+    )
+
+    return (
+        gyro_signed16(
+            gyro_buffer[0],
+            gyro_buffer[1]
+        ),
+        gyro_signed16(
+            gyro_buffer[2],
+            gyro_buffer[3]
+        ),
+        gyro_signed16(
+            gyro_buffer[4],
+            gyro_buffer[5]
+        )
+    )
+
+
+def initialize_gyro():
+
+    global gyro_enabled
+    global gyro_addr
+
+    global gyro_bias_x
+    global gyro_bias_y
+    global gyro_bias_z
+
+    devices = oled_i2c.scan()
+
+    if 0x68 in devices:
+
+        gyro_addr = 0x68
+
+    elif 0x69 in devices:
+
+        gyro_addr = 0x69
+
+    else:
+
+        print(
+            "GYRO: MPU6050 NOT FOUND"
+        )
+
+        gyro_enabled = False
+
+        return
+
+
+    # Wake MPU6050.
+    oled_i2c.writeto_mem(
+        gyro_addr,
+        MPU_PWR_MGMT_1,
+        b"\x00"
+    )
+
+    time.sleep_ms(
+        100
+    )
+
+
+    # +/-500 degrees/second range.
+    oled_i2c.writeto_mem(
+        gyro_addr,
+        MPU_GYRO_CONFIG,
+        b"\x08"
+    )
+
+    time.sleep_ms(
+        50
+    )
+
+
+    print(
+        "GYRO:",
+        hex(gyro_addr)
+    )
+
+    print(
+        "HOLD RIGHT HAND STILL..."
+    )
+
+
+    # Calibrate zero-rate bias.
+    sx = 0
+    sy = 0
+    sz = 0
+
+    count = 60
+
+
+    for _ in range(
+        count
+    ):
+
+        gx, gy, gz = (
+            read_gyro_raw()
+        )
+
+        sx += gx
+        sy += gy
+        sz += gz
+
+        time.sleep_ms(
+            5
+        )
+
+
+    gyro_bias_x = sx // count
+    gyro_bias_y = sy // count
+    gyro_bias_z = sz // count
+
+
+    gyro_enabled = True
+
+    print(
+        "GYRO READY"
+    )
+
+
+def toggle_gyro_reverse():
+
+    global GYRO_REVERSE
+
+    GYRO_REVERSE = (
+        not GYRO_REVERSE
+    )
+
+    print(
+        "GYRO REVERSE:",
+        GYRO_REVERSE
+    )
+
+
+def service_gyro_strum():
+
+    global gyro_armed
+    global last_gyro_read_time
+    global last_gyro_strum_time
+    global strum_direction
+
+
+    if (
+        not gyro_enabled
+        or mode != "CHORD"
+    ):
+
+        return
+
+
+    now = time.ticks_ms()
+
+
+    if time.ticks_diff(
+        now,
+        last_gyro_read_time
+    ) < GYRO_READ_INTERVAL_MS:
+
+        return
+
+
+    last_gyro_read_time = now
+
+
+    try:
+
+        gx, gy, gz = (
+            read_gyro_raw()
+        )
+
+    except OSError:
+
+        return
+
+
+    # +/-500 dps sensitivity is ~65.5 counts/dps.
+    x = (
+        gx - gyro_bias_x
+    ) / 65.5
+
+    y = (
+        gy - gyro_bias_y
+    ) / 65.5
+
+    z = (
+        gz - gyro_bias_z
+    ) / 65.5
+
+
+    # --------------------------------------------------------
+    # CHOOSE STRUM AXIS
+    # --------------------------------------------------------
+
+    if GYRO_AXIS == "X":
+
+        motion = x
+
+    elif GYRO_AXIS == "Y":
+
+        motion = y
+
+    elif GYRO_AXIS == "Z":
+
+        motion = z
+
+    else:
+
+        # AUTO:
+        # use strongest rotational axis for this movement.
+        motion = x
+
+        if abs(y) > abs(motion):
+
+            motion = y
+
+        if abs(z) > abs(motion):
+
+            motion = z
+
+
+    # --------------------------------------------------------
+    # RE-ARM AFTER WRIST RETURNS TO REST
+    # --------------------------------------------------------
+
+    if not gyro_armed:
+
+        if max(
+            abs(x),
+            abs(y),
+            abs(z)
+        ) <= GYRO_RESET_DPS:
+
+            gyro_armed = True
+
+        return
+
+
+    # --------------------------------------------------------
+    # IGNORE SMALL MOVEMENTS
+    # --------------------------------------------------------
+
+    if abs(motion) < GYRO_TRIGGER_DPS:
+
+        return
+
+
+    if time.ticks_diff(
+        now,
+        last_gyro_strum_time
+    ) < GYRO_LOCKOUT_MS:
+
+        return
+
+
+    # --------------------------------------------------------
+    # MOTION SIGN -> UP / DOWN
+    # --------------------------------------------------------
+
+    positive_motion = (
+        motion > 0
+    )
+
+    if GYRO_REVERSE:
+
+        positive_motion = (
+            not positive_motion
+        )
+
+
+    # Default mapping.
+    if positive_motion:
+
+        strum_direction = "DOWN"
+
+    else:
+
+        strum_direction = "UP"
+
+
+    # IMPORTANT:
+    # Start sound immediately.
+    # No OLED redraw and no terminal print in this path.
+    start_strum()
+
+
+    last_gyro_strum_time = now
+
+    gyro_armed = False
+
+
 CHORD_DISPLAY = {
     "C_MAJOR": "C MAJOR",
     "D_MINOR": "D MINOR",
@@ -2119,17 +2476,12 @@ def handle_key_press(
         elif key == "9":
 
 
-            toggle_direction()
+            toggle_gyro_reverse()
 
 
 # ============================================================
 # JOYSTICK
 # ============================================================
-
-def send_web_event(direction):
-    print("AIRFRET|JOY|"+ direction)
-
-
 
 def read_joystick():
 
@@ -2191,12 +2543,10 @@ def read_joystick():
             if dx > 0:
 
                 next_note_effect()
-                send_web_event("RIGHT")
 
             else:
 
                 previous_note_effect()
-                send_web_event("LEFT")
 
             x_ready = False
 
@@ -2222,71 +2572,22 @@ def read_joystick():
             if dx > 0:
 
                 next_chord()
-                send_web_event("RIGHT")
 
 
             else:
 
                 previous_chord()
-                send_web_event("LEFT")
 
 
             x_ready = False
 
 
         # ====================================================
-        # UP / DOWN = STRUM + PLAY
+        # JOYSTICK VERTICAL MOVEMENT
         # ====================================================
-        #
-        # Push joystick UP:
-        #   select UP strum and immediately play it.
-        #
-        # Push joystick DOWN:
-        #   select DOWN strum and immediately play it.
-        #
-        # The joystick must return near center before another
-        # vertical strum can trigger. This prevents one movement
-        # from firing repeatedly.
+        # No strumming here anymore.
+        # Right-hand MPU6050 motion controls UP/DOWN strums.
         # ====================================================
-
-        elif (
-            abs(dy) > abs(dx)
-            and abs(dy) > MOVE_DISTANCE
-            and y_ready
-        ):
-
-            now = time.ticks_ms()
-
-
-            # FAST STRUM PATH:
-            # Do NOT call set_up()/set_down() here because those
-            # functions redraw the OLED before the sound starts.
-            # That I2C display update creates the noticeable delay.
-
-            global strum_direction
-
-            if dy > 0:
-
-                strum_direction = "UP"
-
-            else:
-
-                strum_direction = "DOWN"
-
-
-            # Trigger audio immediately.
-            if time.ticks_diff(
-                now,
-                last_strum_time
-            ) > 60:
-
-                start_strum()
-
-                last_strum_time = now
-                send_web_event(strum_direction)
-
-
-            y_ready = False
 
 
     # --------------------------------------------------------
@@ -2311,10 +2612,12 @@ def read_joystick():
 
 build_notes()
 
+initialize_gyro()
+
 
 print()
 print("================================")
-print(" AIRFRET - FAST JOYSTICK STRUM / LONG RING")
+print(" AIRFRET - RIGHT HAND GYRO STRUM")
 print("================================")
 print()
 
@@ -2348,12 +2651,12 @@ print()
 
 print("JOYSTICK:")
 print("LEFT / RIGHT = CHANGE CHORD")
-print("UP = UP STRUM + PLAY")
-print("DOWN = DOWN STRUM + PLAY")
-print("PRESS = NOT NEEDED")
+print("LEFT / RIGHT = CHANGE CHORD")
+print("UP / DOWN = UNUSED")
+print("PRESS = UNUSED")
 print()
 
-print("9 = TOGGLE UP / DOWN")
+print("9 = REVERSE GYRO UP/DOWN")
 print()
 
 print("VOLUME SLIDER: GP26 / ADC0")
@@ -2371,6 +2674,16 @@ update_oled()
 # ============================================================
 
 while True:
+
+
+    # ========================================================
+    # RIGHT-HAND GYRO STRUM
+    # ========================================================
+    # Service this first so wrist motion starts audio as quickly
+    # as possible.
+    # ========================================================
+
+    service_gyro_strum()
 
 
     # ========================================================
