@@ -1,0 +1,57 @@
+@import url('https://fonts.googleapis.com/css2?family=Bitcount+Prop+Single:wght@400..800&display=swap');
+
+:root {
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    sans-serif;
+  --heading: 'Bitcount Prop Single', var(--sans);
+  --mono: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace;
+  font: 17px/1.45 var(--sans);
+  color: #20150d;
+  background: #756044;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: #756044;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+img,
+svg {
+  display: block;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+}
+
+@media (max-width: 620px) {
+  :root {
+    font-size: 15px;
+  }
+}
